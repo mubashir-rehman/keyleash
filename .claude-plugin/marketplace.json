@@ -1,0 +1,15 @@
+{
+  "name": "keyleash",
+  "description": "keyleash: keyring-backed secrets for coding agents, with per-use approval.",
+  "owner": {
+    "name": "Mubashir Rehman"
+  },
+  "plugins": [
+    {
+      "name": "keyleash",
+      "source": "./",
+      "description": "Use API keys and passwords in commands without the agent ever seeing them: typed into a desktop popup, stored in the system keyring, approved per use, masked in output. Linux (Secret Service).",
+      "category": "security"
+    }
+  ]
+}

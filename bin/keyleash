@@ -1,0 +1,464 @@
+#!/usr/bin/python3
+"""keyleash - let a coding agent use your API keys and passwords without ever seeing them.
+
+Secrets are typed into a desktop popup, stored in the system keyring (Secret Service:
+GNOME Keyring, KWallet, KeePassXC) and injected into one command at a time. Each use
+needs your approval in a popup: once, for a while, or for the current agent session.
+Values are masked in the command's output.
+
+  keyleash add NAME              type a secret into a popup and store it
+  keyleash list                  names only, never values
+  keyleash rm NAME               delete a secret (asks first)
+  keyleash run NAME... -- CMD    run CMD with $NAME set; NAME=VAR exposes it as $VAR instead
+  keyleash grants                show what is currently approved
+  keyleash revoke [NAME]         withdraw approvals (all of them without NAME)
+  keyleash setup login|dedicated where new secrets go: your login keyring, or a separate
+                                keyring with its own password
+  keyleash lock                  lock the dedicated keyring now
+  keyleash hooks [on|off [DIR]]  switch the guard hooks off (or back on) for one project
+
+There is deliberately no command that prints a value.
+"""
+import base64, json, os, re, shlex, subprocess, sys, threading, time, urllib.parse
+
+APP = "keyleash"
+# Secrets saved before the rename (keygate 0.1) are still found, listed and removable.
+LEGACY_APPS = ("keygate",)
+APPS = (APP,) + LEGACY_APPS
+NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), APP, "config.json")
+# Fixed on purpose, not $XDG_RUNTIME_DIR: an approvals file the caller can relocate is no approval at all.
+RUNTIME = f"/run/user/{os.getuid()}/{APP}"
+GRANTS = os.path.join(RUNTIME, "grants.json")
+ONCE, TIMED, SESSION, DENY = "once", "timed", "session", "deny"
+
+
+def die(msg, code=1):
+    print(f"{APP}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def config():
+    try:
+        with open(CONFIG) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        c = {}
+    return {"mode": c.get("mode", "login"), "grant_minutes": int(c.get("grant_minutes", 30)),
+            "hooks_off": [d for d in c.get("hooks_off", []) if isinstance(d, str)]}
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def session_id():
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("KEYLEASH_SESSION") or ""
+
+
+# ---------------------------------------------------------------- popups
+
+def zenity(*args, timeout=120):
+    """Returns (exit code, stdout). Fails closed when there is no desktop to ask on."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        die("no desktop session to show a popup on; refusing", 3)
+    # the simple input method keeps the dialog typeable even when the IBus daemon is unhealthy
+    env = dict(os.environ, GTK_IM_MODULE="gtk-im-context-simple")
+    try:
+        r = subprocess.run(["zenity", *args, f"--timeout={timeout}"], capture_output=True, text=True, env=env)
+    except FileNotFoundError:
+        die("zenity is not installed (sudo apt install zenity)", 3)
+    return r.returncode, r.stdout.strip("\n")
+
+
+def ask_value(name):
+    rc, out = zenity("--entry", "--hide-text", f"--title={APP}: add secret", "--width=460",
+                     f"--text=Value for {name}\n\nIt goes straight to your keyring. The agent only learns the name.",
+                     timeout=300)
+    return out if rc == 0 else None
+
+
+def ask_approval(names, cmd, minutes):
+    """The popup that gates every use. Anything other than an explicit allow is a deny."""
+    sid = session_id()
+    shown = " ".join(shlex.quote(c) for c in cmd)
+    shown = shown if len(shown) <= 700 else shown[:700] + " …"
+    text = (f"An agent wants to use: {', '.join(names)}\n\n"
+            f"Command:\n{shown}\n\n"
+            f"Directory: {os.getcwd()}\n"
+            f"Session: {sid[:8] if sid else 'not an agent session'}")
+    args = ["--question", f"--title={APP}: allow secret?", "--no-markup", "--width=620", "--default-cancel",
+            f"--text={text}", "--ok-label=Allow once", "--cancel-label=Deny", f"--extra-button=Allow {minutes} min"]
+    if sid:
+        args.append("--extra-button=Allow this session")
+    rc, out = zenity(*args)
+    if rc == 0:
+        return ONCE
+    if out == f"Allow {minutes} min":
+        return TIMED
+    if out == "Allow this session" and sid:
+        return SESSION
+    return DENY
+
+
+def confirm(text):
+    return zenity("--question", f"--title={APP}", "--no-markup", "--default-cancel", f"--text={text}")[0] == 0
+
+
+# ---------------------------------------------------------------- keyring
+
+def bus():
+    try:
+        import secretstorage
+    except ImportError:
+        die("python3-secretstorage is missing (sudo apt install python3-secretstorage)", 3)
+    return secretstorage, secretstorage.dbus_init()
+
+
+def collections(create_dedicated=False):
+    """{'login': collection, 'dedicated': collection or None}"""
+    ss, conn = bus()
+    dedicated = next((c for c in ss.get_all_collections(conn) if c.get_label() in APPS), None)
+    if dedicated is None and create_dedicated:
+        dedicated = ss.create_collection(conn, APP)  # the keyring asks for the new password itself
+    return {"login": ss.get_default_collection(conn), "dedicated": dedicated}
+
+
+def find(name):
+    """(where, collection, item) for a stored secret, the configured place first."""
+    cols = collections()
+    order = ["dedicated", "login"] if config()["mode"] == "dedicated" else ["login", "dedicated"]
+    for where in order:
+        col = cols[where]
+        if col is None:
+            continue
+        for app in APPS:
+            for item in col.search_items({"application": app, "name": name}):
+                return where, col, item
+    return None, None, None
+
+
+def unlock(col):
+    """True when usable. Unlocking a locked keyring shows the keyring's own password prompt."""
+    if col.is_locked():
+        col.unlock()
+    return not col.is_locked()
+
+
+def store(name, value, where=None):
+    where = where or config()["mode"]
+    col = collections(create_dedicated=(where == "dedicated"))[where]
+    if col is None or not unlock(col):
+        die(f"the {where} keyring is locked or missing")
+    col.create_item(f"{APP}: {name}", {"application": APP, "name": name}, value.encode(), replace=True)
+    return where
+
+
+def lookup(name):
+    where, col, item = find(name)
+    if item is None:
+        die(f"no secret named {name} (add it with: {APP} add {name})")
+    if not unlock(col):
+        die(f"the {where} keyring stayed locked")
+    return item.get_secret()
+
+
+def lock_dedicated():
+    col = collections()["dedicated"]
+    if col is not None and not col.is_locked():
+        col.lock()
+        return True
+    return False
+
+
+# ---------------------------------------------------------------- grants
+
+def load_grants(now=None):
+    """Active grants only: {name: [{"until": ts} | {"session": id}]}"""
+    now = now or time.time()
+    try:
+        with open(GRANTS) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    live = {}
+    for name, gs in raw.items():
+        keep = [g for g in gs if g.get("session") or g.get("until", 0) > now]
+        if keep:
+            live[name] = keep
+    return live
+
+
+def save_grants(grants):
+    os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+    tmp = GRANTS + ".tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(grants, f)
+    os.replace(tmp, GRANTS)
+
+
+def granted(name, grants, sid, now=None):
+    now = now or time.time()
+    return any((g.get("session") and g["session"] == sid) or g.get("until", 0) > now for g in grants.get(name, []))
+
+
+def add_grant(names, kind, minutes):
+    grants = load_grants()
+    for n in names:
+        g = {"session": session_id()} if kind == SESSION else {"until": time.time() + minutes * 60}
+        grants.setdefault(n, []).append(g)
+    save_grants(grants)
+
+
+def lock_later(seconds):
+    """Dedicated keyring: gnome-keyring has no idle timer, so schedule our own."""
+    subprocess.run(["systemd-run", "--user", "--quiet", f"--on-active={int(seconds) + 5}",
+                    os.path.realpath(__file__), "lock", "--if-idle"], capture_output=True)
+
+
+# ---------------------------------------------------------------- masking
+
+def variants(value):
+    """The value and the encodings it most often shows up in."""
+    out = {value}
+    for line in value.splitlines():
+        out.add(line.strip())
+    out |= {base64.b64encode(value), base64.urlsafe_b64encode(value), value.hex().encode(),
+            urllib.parse.quote(value, safe="").encode(), urllib.parse.quote_plus(value).encode()}
+    out |= {v.rstrip(b"=") for v in list(out)}
+    return {v for v in out if len(v) >= 6}
+
+
+def masker(secrets):
+    """secrets: {name: value bytes} -> function masking them in a chunk of bytes."""
+    table = sorted(((v, f"[secret:{n}]".encode()) for n, val in secrets.items() for v in variants(val)),
+                   key=lambda x: -len(x[0]))
+
+    def mask(data):
+        for needle, label in table:
+            if needle in data:
+                data = data.replace(needle, label)
+        return data
+    return mask
+
+
+def pump(src, dst, mask):
+    for line in iter(src.readline, b""):
+        dst.write(mask(line))
+        dst.flush()
+
+
+# ---------------------------------------------------------------- commands
+
+def parse_run(args):
+    if "--" not in args:
+        die("usage: keyleash run NAME[=VAR]... -- command [args]", 2)
+    i = args.index("--")
+    specs, cmd = args[:i], args[i + 1:]
+    if not specs or not cmd:
+        die("usage: keyleash run NAME[=VAR]... -- command [args]", 2)
+    pairs = []
+    for s in specs:
+        name, _, var = s.partition("=")
+        if not NAME_RE.match(name) or (var and not NAME_RE.match(var)):
+            die(f"bad secret name: {s}", 2)
+        pairs.append((name, var or name))
+    return pairs, cmd
+
+
+def cmd_run(args):
+    pairs, cmd = parse_run(args)
+    names = [n for n, _ in pairs]
+    for n in names:
+        if find(n)[2] is None:
+            die(f"no secret named {n} (add it with: {APP} add {n})")
+    cfg, sid = config(), session_id()
+    grants = load_grants()
+    need = [n for n in names if not granted(n, grants, sid)]
+    kind = None
+    if need:
+        kind = ask_approval(need, cmd, cfg["grant_minutes"])
+        if kind == DENY:
+            die("denied by the user", 77)
+        if kind in (TIMED, SESSION):
+            add_grant(need, kind, cfg["grant_minutes"])
+    values = {n: lookup(n) for n in names}
+    dedicated = any(find(n)[0] == "dedicated" for n in names)
+    env = dict(os.environ)
+    for n, var in pairs:
+        env[var] = values[n].decode(errors="surrogateescape")
+    mask = masker(values)
+    try:
+        p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        die(f"cannot run {cmd[0]}: {e.strerror}", 127)
+    threads = [threading.Thread(target=pump, args=(p.stdout, sys.stdout.buffer, mask)),
+               threading.Thread(target=pump, args=(p.stderr, sys.stderr.buffer, mask))]
+    for t in threads:
+        t.start()
+    try:
+        code = p.wait()
+    except KeyboardInterrupt:
+        p.terminate()
+        code = 130
+    for t in threads:
+        t.join()
+    p.stdout.close()
+    p.stderr.close()
+    if dedicated:
+        if kind == TIMED:
+            lock_later(cfg["grant_minutes"] * 60)
+        elif not any(load_grants().values()):
+            lock_dedicated()
+    sys.exit(code)
+
+
+def cmd_add(args):
+    if len(args) != 1 or not NAME_RE.match(args[0]):
+        die("usage: keyleash add NAME   (letters, digits and _; it becomes the environment variable name)", 2)
+    name = args[0]
+    value = ask_value(name)
+    if not value:
+        die("nothing entered; not stored")
+    where = store(name, value)
+    note = "  (short values cannot be masked reliably)" if len(value) < 6 else ""
+    print(f"stored {name} in the {where} keyring ({len(value)} characters){note}")
+
+
+def cmd_list(args):
+    cols, grants, sid = collections(), load_grants(), session_id()
+    rows = []
+    for where, col in cols.items():
+        if col is None:
+            continue
+        items = [i for app in APPS for i in col.search_items({"application": app})]
+        for item in items:
+            n = item.get_attributes().get("name", "?")
+            state = "approved" if granted(n, grants, sid) else ""
+            rows.append((n, where + (" (locked)" if col.is_locked() else ""), state))
+    if not rows:
+        print(f"no secrets stored yet (add one with: {APP} add NAME)")
+    for n, where, state in sorted(rows):
+        print(f"{n:<32} {where:<20} {state}")
+
+
+def cmd_rm(args):
+    if len(args) != 1:
+        die("usage: keyleash rm NAME", 2)
+    where, col, item = find(args[0])
+    if item is None:
+        die(f"no secret named {args[0]}")
+    if not confirm(f"Delete the secret {args[0]} from the {where} keyring?"):
+        die("not deleted")
+    if not unlock(col):
+        die(f"the {where} keyring stayed locked")
+    item.delete()
+    grants = load_grants()
+    grants.pop(args[0], None)
+    save_grants(grants)
+    print(f"deleted {args[0]}")
+
+
+def cmd_grants(args):
+    grants = load_grants()
+    if not grants:
+        print("nothing is approved right now")
+    for n, gs in sorted(grants.items()):
+        for g in gs:
+            how = f"session {g['session'][:8]}" if g.get("session") else \
+                f"until {time.strftime('%H:%M', time.localtime(g['until']))}"
+            print(f"{n:<32} {how}")
+
+
+def cmd_revoke(args):
+    grants = load_grants()
+    if args:
+        grants.pop(args[0], None)
+    else:
+        grants = {}
+    save_grants(grants)
+    locked = not any(grants.values()) and lock_dedicated()
+    print("revoked" + (" and locked the dedicated keyring" if locked else ""))
+
+
+def cmd_lock(args):
+    if "--if-idle" in args and any(load_grants().values()):
+        return
+    print("locked" if lock_dedicated() else "nothing to lock")
+
+
+def cmd_session_end(args):
+    """Called by the SessionEnd hook: forget that session's approvals."""
+    sid = args[0] if args else session_id()
+    grants = {n: [g for g in gs if g.get("session") != sid] for n, gs in load_grants().items()}
+    grants = {n: gs for n, gs in grants.items() if gs}
+    save_grants(grants)
+    if not grants:
+        try:
+            lock_dedicated()
+        except Exception:
+            pass
+
+
+def cmd_setup(args):
+    if len(args) != 1 or args[0] not in ("login", "dedicated"):
+        die("usage: keyleash setup login|dedicated", 2)
+    if args[0] == "dedicated":
+        collections(create_dedicated=True)
+    cfg = config()
+    cfg["mode"] = args[0]
+    save_config(cfg)
+    print(f"new secrets will go to the {args[0]} keyring")
+
+
+def project_dirs(path):
+    """The directory, or for a git checkout the repository and all of its worktrees."""
+    path = os.path.realpath(path)
+    r = subprocess.run(["git", "-C", path, "worktree", "list", "--porcelain"], capture_output=True, text=True)
+    trees = [os.path.realpath(l[9:]) for l in r.stdout.splitlines() if l.startswith("worktree ")]
+    return trees if r.returncode == 0 and trees else [path]
+
+
+def cmd_hooks(args):
+    """Switch the guard hooks off for one project. `keyleash run` still works there."""
+    cfg = config()
+    if not args:
+        here = os.path.realpath(os.getcwd())
+        off = any(here == d or here.startswith(d + os.sep) for d in cfg["hooks_off"])
+        print(f"hooks are {'OFF' if off else 'on'} in {here}")
+        for d in cfg["hooks_off"]:
+            print(f"  off: {d}")
+        return
+    if args[0] not in ("on", "off") or len(args) > 2:
+        die("usage: keyleash hooks [on|off [DIR]]", 2)
+    dirs = project_dirs(args[1] if len(args) == 2 else os.getcwd())
+    if args[0] == "off":
+        # the hooks are a guard on the agent, so the agent must not be able to switch them off alone
+        if not confirm("Switch keyleash's guard hooks OFF for:\n\n" + "\n".join(dirs) +
+                       "\n\nThe agent will no longer be stopped from reading the keyring directly or from "
+                       "writing credentials into files in this project."):
+            die("left on")
+        cfg["hooks_off"] = sorted(set(cfg["hooks_off"]) | set(dirs))
+    else:
+        cfg["hooks_off"] = [d for d in cfg["hooks_off"] if d not in dirs]
+    save_config(cfg)
+    print(f"hooks {args[0]} for:\n  " + "\n  ".join(dirs))
+
+
+COMMANDS = {"add": cmd_add, "list": cmd_list, "rm": cmd_rm, "run": cmd_run, "grants": cmd_grants,
+            "revoke": cmd_revoke, "lock": cmd_lock, "setup": cmd_setup, "session-end": cmd_session_end,
+            "hooks": cmd_hooks}
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] not in COMMANDS:
+        print(__doc__.strip())
+        sys.exit(0 if a and a[0] in ("-h", "--help", "help") else 2)
+    COMMANDS[a[0]](a[1:])
+
+
+if __name__ == "__main__":
+    main()
