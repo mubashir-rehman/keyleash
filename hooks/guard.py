@@ -12,8 +12,14 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 KEYLEASH = os.path.join(os.path.dirname(HERE), "bin", "keyleash")
 
 BYPASS = [
-    (r"keyleash/grants", "the keyleash approvals file"),
-    (r"keyleash/config\.json", "the keyleash settings file"),
+    (r"(keyleash|keygate)/(grants|config)", "the keyleash approvals or settings file"),
+    (r"/run/user/(\d+|\$\{?\w+\}?)/(keyleash|keygate)\b|\$\{?XDG_RUNTIME_DIR\}?/(keyleash|keygate)\b",
+     "the keyleash approvals folder"),
+    (r"\.config/(keyleash|keygate)\b", "the keyleash settings folder"),
+    (r"\bgrants\.json\b", "the keyleash approvals file"),
+    (r"/proc/[^\n]*?/environ\b","another process's environment, where a running command's secret lives"),
+    (r"\bps\s+(?:[^-\s|;&][^\s|;&]*\s+)*[a-zA-Z]*e[a-zA-Z]*(?=\s|$|[|;&])",
+     "process environments (ps e), where a running command's secret lives"),
     (r"\bsecret-tool\b", "secret-tool"),
     (r"(import|from)\s+secretstorage|secretstorage\.", "the secretstorage library"),
     (r"org\.freedesktop\.secrets?", "the Secret Service bus"),
@@ -56,7 +62,7 @@ def main():
 
     if event == "PreToolUse":
         ti = data.get("tool_input") or {}
-        text = " ".join(str(ti.get(k, "")) for k in ("command", "file_path"))
+        text = " ".join(str(ti.get(k, "")) for k in ("command", "file_path", "notebook_path"))
         for pattern, what in BYPASS:
             if re.search(pattern, text):
                 print(f"keyleash: blocked, this touches {what} directly. Secrets are only used through "
@@ -70,7 +76,8 @@ def main():
                                                 "to drive the desktop; it must never be used on a keyleash popup."}}))
                 return 0
         # a credential about to be written into a file: let the user decide
-        written = " ".join(str(ti.get(k, "")) for k in ("content", "new_string"))
+        written = " ".join([str(ti.get(k, "")) for k in ("content", "new_string", "new_source")] +
+                           [str(e.get("new_string", "")) for e in ti.get("edits") or [] if isinstance(e, dict)])
         if any(re.search(p, written) for p in KEY_SHAPES):
             print(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "ask",
@@ -81,9 +88,12 @@ def main():
     if event == "UserPromptSubmit":
         prompt = data.get("prompt") or data.get("user_prompt") or ""
         if any(re.search(p, prompt) for p in KEY_SHAPES):
-            print("keyleash: the user's message appears to contain a credential. Do not repeat it or write it "
-                  "to any file. Suggest storing it with `keyleash add NAME` (a popup, so it stays out of the "
-                  "conversation) and rotating it if it is a real key, since it is now in this transcript.")
+            # Blocked, so the message is not sent to the model. To paste keys on purpose in one
+            # project, switch the guard off there: keyleash hooks off
+            print(json.dumps({"decision": "block", "reason":
+                              "keyleash: this message looks like it contains a credential, so it was not sent. "
+                              "Store it with `keyleash add NAME` (a popup) and refer to it by name. If it is a "
+                              "real key, consider rotating it anyway."}))
         return 0
 
     if event == "SessionEnd":

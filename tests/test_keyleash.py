@@ -4,7 +4,7 @@
 Nothing here shows a popup. The keyring round trip uses a dummy value in the login keyring
 and is skipped when no unlocked keyring is available.
 """
-import base64, importlib.machinery, importlib.util, io, json, os, subprocess, sys, tempfile, time, unittest
+import base64, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -80,14 +80,17 @@ class Grants(unittest.TestCase):
 class Run(unittest.TestCase):
     """cmd_run with the keyring and the popup replaced; the child process is real."""
 
-    def run_it(self, argv, decision, session="s1"):
-        kg.save_grants({})
+    CHOICE = {kg.ONCE: "once", kg.SESSION: "any-session", kg.TIMED: "any-timed", kg.DENY: None}
+
+    def run_it(self, argv, decision, session="s1", choice=None, keep=False):
+        if not keep:
+            kg.save_grants({})
         out, err = tempfile.TemporaryFile(), tempfile.TemporaryFile()
         asked = []
 
-        def approve(names, cmd, minutes):
+        def approve(names, cmd, minutes, default=None):
             asked.append(list(names))
-            return decision
+            return decision, choice or self.CHOICE[decision]
 
         fake_out = mock.Mock(buffer=out)
         fake_err = mock.Mock(buffer=err, write=lambda s: None)
@@ -134,6 +137,75 @@ class Run(unittest.TestCase):
         self.run_it(["K", "--", "true"], kg.TIMED)
         (g,) = kg.load_grants()["K"]
         self.assertAlmostEqual(g["until"], time.time() + 30 * 60, delta=5)
+
+    def test_program_grant_covers_that_program_only(self):
+        self.run_it(["K", "--", "true"], kg.SESSION, choice="prog-session")
+        (g,) = kg.load_grants()["K"]
+        self.assertEqual(g["scope"], {"prog": os.path.realpath(shutil.which("true"))})
+        _, _, _, asked = self.run_it(["K", "--", "true"], kg.SESSION, choice="prog-session", keep=True)
+        self.assertEqual(asked, [])                                   # same program: no popup
+        _, _, _, asked = self.run_it(["K", "--", "echo", "x"], kg.ONCE, keep=True)
+        self.assertEqual(asked, [["K"]])                              # another program: asked
+
+    def test_a_lookalike_program_is_not_the_approved_one(self):
+        self.run_it(["K", "--", "true"], kg.SESSION, choice="prog-session")
+        fake = os.path.join(tempfile.mkdtemp(), "true")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake, 0o755)
+        _, _, _, asked = self.run_it(["K", "--", fake], kg.ONCE, keep=True)
+        self.assertEqual(asked, [["K"]])
+
+    def test_shells_get_exact_command_approvals(self):
+        self.run_it(["K", "--", "sh", "-c", "true"], kg.SESSION, choice="prog-session")
+        (g,) = kg.load_grants()["K"]
+        self.assertEqual(g["scope"], {"cmd": ["sh", "-c", "true"]})
+        _, _, _, asked = self.run_it(["K", "--", "sh", "-c", "true"], kg.ONCE, keep=True)
+        self.assertEqual(asked, [])
+        _, _, _, asked = self.run_it(["K", "--", "sh", "-c", 'printf %s "$K" | rev'], kg.ONCE, keep=True)
+        self.assertEqual(asked, [["K"]])
+
+    def test_any_command_grant_still_available(self):
+        self.run_it(["K", "--", "true"], kg.TIMED, choice="any-timed")
+        _, _, _, asked = self.run_it(["K", "--", "sh", "-c", "true"], kg.ONCE, keep=True)
+        self.assertEqual(asked, [])
+
+
+class Popup(unittest.TestCase):
+    def test_long_commands_show_start_and_end(self):
+        shown, warning = kg.shorten("a" * 500 + "MIDDLE" + "b" * 300)
+        self.assertTrue(shown.startswith("a" * 450) and shown.endswith("b" * 200))
+        self.assertIn("characters not shown", shown)
+        self.assertIn("too long", warning)
+        self.assertEqual(kg.shorten("curl x"), ("curl x", ""))
+
+    def zenity_args(self, cmd, sid="s1", default="prog-session"):
+        seen = {}
+
+        def fake(*args, **kw):
+            seen["args"] = args
+            return 0, "prog-session"
+        with mock.patch.object(kg, "zenity", side_effect=fake), mock.patch.object(kg, "session_id", return_value=sid):
+            result = kg.ask_approval(["K"], cmd, 30, default)
+        return result, seen["args"]
+
+    def test_one_list_one_row_of_buttons(self):
+        (kind, choice), args = self.zenity_args(["curl", "https://example.com"])
+        self.assertEqual((kind, choice), (kg.SESSION, "prog-session"))
+        self.assertIn("Allow curl commands this session", args)
+        self.assertNotIn("--extra-button", " ".join(args))
+        self.assertEqual(args[args.index("Allow curl commands this session") - 1], "TRUE")  # the default
+
+    def test_shell_rows_say_exact_command_and_no_session_rows_outside_agents(self):
+        _, args = self.zenity_args(["sh", "-c", "true"], sid="")
+        self.assertIn("Allow this exact command for 30 min", args)
+        self.assertFalse(any(isinstance(a, str) and a.endswith("this session") for a in args))
+
+    def test_anything_but_allow_is_deny(self):
+        with mock.patch.object(kg, "zenity", return_value=(1, "")), mock.patch.object(kg, "session_id", return_value="s"):
+            self.assertEqual(kg.ask_approval(["K"], ["true"], 30)[0], kg.DENY)
+        with mock.patch.object(kg, "zenity", return_value=(0, "made-up")), mock.patch.object(kg, "session_id", return_value="s"):
+            self.assertEqual(kg.ask_approval(["K"], ["true"], 30)[0], kg.DENY)
 
 
 class Guard(unittest.TestCase):
@@ -196,11 +268,30 @@ class Guard(unittest.TestCase):
             r = self.hook({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}})
             self.assertEqual(r.returncode, 0, cmd)
 
-    def test_notices_pasted_credential(self):
+    def test_holds_back_a_pasted_credential(self):
         r = self.hook({"hook_event_name": "UserPromptSubmit", "prompt": "use sk-" + "a1B2" * 8 + " for the call"})
-        self.assertIn("credential", r.stdout)
+        self.assertEqual(json.loads(r.stdout)["decision"], "block")
         r = self.hook({"hook_event_name": "UserPromptSubmit", "prompt": "what does the sk- prefix mean?"})
         self.assertEqual(r.stdout, "")
+
+    def test_blocks_reading_a_running_commands_environment_and_side_routes(self):
+        for cmd in ("cat /proc/4242/environ", "tr '\\0' '\\n' < /proc/$(pgrep node)/environ", "ps eww",
+                    "ps auxe | grep node", "cd /run/user/1000/keyleash && cat *", "ls $XDG_RUNTIME_DIR/keyleash",
+                    "cat ~/.config/keyleash/x", "find / -name grants.json"):
+            r = self.hook({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}})
+            self.assertEqual(r.returncode, 2, cmd)
+        for cmd in ("ps -ef", "ps aux | grep node", "cd ~/development/keyleash && git status",
+                    "keyleash run K -- node build.js --config config.json"):
+            r = self.hook({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}})
+            self.assertEqual(r.returncode, 0, cmd)
+
+    def test_multiedit_and_notebook_writes_are_checked(self):
+        r = self.hook({"hook_event_name": "PreToolUse", "tool_name": "MultiEdit",
+                       "tool_input": {"file_path": "/tmp/a.py", "edits": [{"new_string": "k='sk-" + "a1B2" * 8 + "'"}]}})
+        self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
+        r = self.hook({"hook_event_name": "PreToolUse", "tool_name": "NotebookEdit",
+                       "tool_input": {"notebook_path": "/run/user/1000/keyleash/grants.json", "new_source": "{}"}})
+        self.assertEqual(r.returncode, 2)
 
 
 class Keyring(unittest.TestCase):

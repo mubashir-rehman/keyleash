@@ -19,7 +19,7 @@ Values are masked in the command's output.
 
 There is deliberately no command that prints a value.
 """
-import base64, json, os, re, shlex, subprocess, sys, threading, time, urllib.parse
+import base64, json, os, re, shlex, shutil, subprocess, sys, threading, time, urllib.parse
 
 APP = "keyleash"
 # Secrets saved before the rename (keygate 0.1) are still found, listed and removable.
@@ -31,6 +31,14 @@ CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.c
 RUNTIME = f"/run/user/{os.getuid()}/{APP}"
 GRANTS = os.path.join(RUNTIME, "grants.json")
 ONCE, TIMED, SESSION, DENY = "once", "timed", "session", "deny"
+CHOICES = ("once", "prog-session", "prog-timed", "any-session", "any-timed")
+# Programs that can run arbitrary code (shells, interpreters, wrappers, task runners, tools with
+# aliases or hooks). Approving "this program" for one of them would approve everything, so their
+# approvals cover only the exact same command.
+RUNS_ANYTHING = re.compile(
+    r"^(sh|bash|zsh|dash|ksh|fish|env|sudo|doas|su|timeout|nohup|nice|ionice|stdbuf|xargs|time|watch|strace|"
+    r"python[0-9.]*|node|nodejs|bun|bunx|deno|perl|ruby|php|lua|tclsh|R|Rscript|awk|gawk|mawk|sed|"
+    r"npx|pnpx|uvx|uv|npm|pnpm|yarn|make|just|cargo|go|java|git|gh|ssh|docker|podman|kubectl)$")
 
 
 def die(msg, code=1):
@@ -44,8 +52,10 @@ def config():
             c = json.load(f)
     except (OSError, ValueError):
         c = {}
+    choice = c.get("default_choice")
     return {"mode": c.get("mode", "login"), "grant_minutes": int(c.get("grant_minutes", 30)),
-            "hooks_off": [d for d in c.get("hooks_off", []) if isinstance(d, str)]}
+            "hooks_off": [d for d in c.get("hooks_off", []) if isinstance(d, str)],
+            "default_choice": choice if choice in CHOICES else "prog-session"}
 
 
 def save_config(cfg):
@@ -80,27 +90,70 @@ def ask_value(name):
     return out if rc == 0 else None
 
 
-def ask_approval(names, cmd, minutes):
-    """The popup that gates every use. Anything other than an explicit allow is a deny."""
+def program(cmd):
+    """The resolved path of the program a command runs, so ./curl is not the approved curl."""
+    found = shutil.which(cmd[0]) if os.sep not in cmd[0] else cmd[0]
+    return os.path.realpath(found) if found else None
+
+
+def runs_anything(cmd):
+    return bool(RUNS_ANYTHING.match(os.path.basename(cmd[0])))
+
+
+def scope_for(choice, cmd):
+    """What an approval covers: None means any command using the secret."""
+    if choice.startswith("any-"):
+        return None
+    if runs_anything(cmd) or program(cmd) is None:
+        return {"cmd": list(cmd)}
+    return {"prog": program(cmd)}
+
+
+def shorten(shown, limit=700):
+    """Long commands keep their start and end visible; the cut is said out loud."""
+    if len(shown) <= limit:
+        return shown, ""
+    head, tail = shown[:450], shown[-200:]
+    hidden = len(shown) - len(head) - len(tail)
+    return f"{head} [… {hidden} characters not shown …] {tail}", \
+        "\nThis command is too long to show in full. Deny it unless you know what the middle does.\n"
+
+
+def ask_approval(names, cmd, minutes, default="prog-session"):
+    """The popup that gates every use. Returns (kind, choice); anything but an explicit allow is a deny."""
     sid = session_id()
-    shown = " ".join(shlex.quote(c) for c in cmd)
-    shown = shown if len(shown) <= 700 else shown[:700] + " …"
+    shown, warning = shorten(" ".join(shlex.quote(c) for c in cmd))
+    home, cwd = os.path.expanduser("~"), os.getcwd()
+    where = "~" + cwd[len(home):] if cwd == home or cwd.startswith(home + os.sep) else cwd
     text = (f"An agent wants to use: {', '.join(names)}\n\n"
-            f"Command:\n{shown}\n\n"
-            f"Directory: {os.getcwd()}\n"
+            f"Command:\n{shown}\n{warning}\n"
+            f"Directory: {where}\n"
             f"Session: {sid[:8] if sid else 'not an agent session'}")
-    args = ["--question", f"--title={APP}: allow secret?", "--no-markup", "--width=620", "--default-cancel",
-            f"--text={text}", "--ok-label=Allow once", "--cancel-label=Deny", f"--extra-button=Allow {minutes} min"]
-    if sid:
-        args.append("--extra-button=Allow this session")
+    what = "this exact command" if runs_anything(cmd) or program(cmd) is None \
+        else f"{os.path.basename(cmd[0])} commands"
+    rows = [("once", "Allow once"),
+            ("prog-session", f"Allow {what} this session"),
+            ("prog-timed", f"Allow {what} for {minutes} min"),
+            ("any-session", "Allow any command this session"),
+            ("any-timed", f"Allow any command for {minutes} min")]
+    if not sid:
+        rows = [r for r in rows if not r[0].endswith("-session")]
+        default = default.replace("-session", "-timed")
+    if default not in [r[0] for r in rows]:
+        default = "once"
+    args = ["--list", "--radiolist", f"--title={APP}: allow secret?", "--no-markup", "--width=640",
+            f"--height={560 + 40 * (shown.count(chr(10)) + (3 if warning else 0))}", f"--text={text}",
+            "--ok-label=Allow", "--cancel-label=Deny",
+            "--column=", "--column=This approval covers", "--column=id", "--print-column=3", "--hide-column=3"]
+    for key, label in rows:
+        args += ["TRUE" if key == default else "FALSE", label, key]
     rc, out = zenity(*args)
-    if rc == 0:
-        return ONCE
-    if out == f"Allow {minutes} min":
-        return TIMED
-    if out == "Allow this session" and sid:
-        return SESSION
-    return DENY
+    choice = out.strip().split("|")[0]
+    if rc != 0 or choice not in [r[0] for r in rows]:
+        return DENY, None
+    if choice == "once":
+        return ONCE, choice
+    return (SESSION if choice.endswith("-session") else TIMED), choice
 
 
 def confirm(text):
@@ -199,15 +252,38 @@ def save_grants(grants):
     os.replace(tmp, GRANTS)
 
 
-def granted(name, grants, sid, now=None):
+def covers(scope, cmd):
+    """Does an approval's scope cover this command? No scope: any command. No command: only unscoped."""
+    if not scope:
+        return True
+    if cmd is None:
+        return False
+    if "cmd" in scope:
+        return list(cmd) == scope["cmd"]
+    return not runs_anything(cmd) and program(cmd) == scope.get("prog")
+
+
+def granted(name, grants, sid, now=None, cmd=None):
     now = now or time.time()
-    return any((g.get("session") and g["session"] == sid) or g.get("until", 0) > now for g in grants.get(name, []))
+    return any(((g.get("session") and g["session"] == sid) or g.get("until", 0) > now)
+               and covers(g.get("scope"), cmd) for g in grants.get(name, []))
 
 
-def add_grant(names, kind, minutes):
+def describe(g):
+    when = f"session {g['session'][:8]}" if g.get("session") else \
+        f"until {time.strftime('%H:%M', time.localtime(g['until']))}"
+    s = g.get("scope")
+    what = "any command" if not s else (os.path.basename(s["prog"]) + " commands" if "prog" in s
+                                        else "only: " + " ".join(shlex.quote(c) for c in s["cmd"])[:80])
+    return f"{when}, {what}"
+
+
+def add_grant(names, kind, minutes, scope=None):
     grants = load_grants()
     for n in names:
         g = {"session": session_id()} if kind == SESSION else {"until": time.time() + minutes * 60}
+        if scope:
+            g["scope"] = scope
         grants.setdefault(n, []).append(g)
     save_grants(grants)
 
@@ -276,14 +352,14 @@ def cmd_run(args):
             die(f"no secret named {n} (add it with: {APP} add {n})")
     cfg, sid = config(), session_id()
     grants = load_grants()
-    need = [n for n in names if not granted(n, grants, sid)]
+    need = [n for n in names if not granted(n, grants, sid, cmd=cmd)]
     kind = None
     if need:
-        kind = ask_approval(need, cmd, cfg["grant_minutes"])
+        kind, choice = ask_approval(need, cmd, cfg["grant_minutes"], cfg["default_choice"])
         if kind == DENY:
             die("denied by the user", 77)
         if kind in (TIMED, SESSION):
-            add_grant(need, kind, cfg["grant_minutes"])
+            add_grant(need, kind, cfg["grant_minutes"], scope_for(choice, cmd))
     values = {n: lookup(n) for n in names}
     dedicated = any(find(n)[0] == "dedicated" for n in names)
     env = dict(os.environ)
@@ -336,7 +412,8 @@ def cmd_list(args):
         items = [i for app in APPS for i in col.search_items({"application": app})]
         for item in items:
             n = item.get_attributes().get("name", "?")
-            state = "approved" if granted(n, grants, sid) else ""
+            live = [g for g in grants.get(n, []) if g.get("until") or g.get("session") == sid]
+            state = "approved: " + "; ".join(describe(g) for g in live) if live else ""
             rows.append((n, where + (" (locked)" if col.is_locked() else ""), state))
     if not rows:
         print(f"no secrets stored yet (add one with: {APP} add NAME)")
@@ -367,9 +444,7 @@ def cmd_grants(args):
         print("nothing is approved right now")
     for n, gs in sorted(grants.items()):
         for g in gs:
-            how = f"session {g['session'][:8]}" if g.get("session") else \
-                f"until {time.strftime('%H:%M', time.localtime(g['until']))}"
-            print(f"{n:<32} {how}")
+            print(f"{n:<32} {describe(g)}")
 
 
 def cmd_revoke(args):
