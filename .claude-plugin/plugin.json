@@ -1,6 +1,6 @@
 {
   "name": "keyleash",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Use API keys and passwords in commands without the agent ever seeing them: typed into a desktop popup, stored in the system keyring, approved per use, masked in output. Linux (Secret Service).",
   "author": { "name": "Mubashir Rehman" },
   "license": "MIT",

@@ -304,6 +304,13 @@ def variants(value):
     out |= {base64.b64encode(value), base64.urlsafe_b64encode(value), value.hex().encode(),
             urllib.parse.quote(value, safe="").encode(), urllib.parse.quote_plus(value).encode()}
     out |= {v.rstrip(b"=") for v in list(out)}
+    # The value inside a longer base64 string (HTTP Basic "user:key", a JSON blob): base64 works in
+    # 3-byte groups, so encode it at each of the three offsets and keep only the characters that
+    # depend on the value alone. A few characters at each edge stay visible.
+    for k in range(3):
+        groups = (len(value) + k) // 3
+        for enc in (base64.b64encode, base64.urlsafe_b64encode):
+            out.add(enc(b"\0" * k + value)[4 if k else 0:groups * 4])
     return {v for v in out if len(v) >= 6}
 
 

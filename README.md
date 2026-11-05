@@ -93,7 +93,9 @@ keyleash keeps secrets out of conversations, transcripts, shell history and file
 every use something you agreed to. It is not a sandbox.
 
 - A command you approve receives the real value. Masking covers the value itself and its
-  base64, hex and URL-encoded forms in the output; a command that transforms the value some
+  base64, hex and URL-encoded forms in the output, including the value inside a longer base64
+  string such as an HTTP Basic header (a few characters at its edges stay visible). A command
+  that transforms the value some
   other way (`printf %s "$KEY" | rev`), or sends it over the network, is not stopped. Read the
   command in the popup.
 - **The popup is your review, so wider approvals review less.** After "*program* commands",

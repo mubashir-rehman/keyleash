@@ -34,6 +34,16 @@ class Masking(unittest.TestCase):
         mask = kg.masker({"PEM": b"-----BEGIN-----\nMIIabcdefgh\n-----END-----"})
         self.assertEqual(mask(b"got MIIabcdefgh here"), b"got [secret:PEM] here")
 
+    def test_value_inside_a_longer_base64_string(self):
+        mask = kg.masker({"K": DUMMY})
+        for wrapped in (DUMMY + b":", b"user:" + DUMMY, b"ab" + DUMMY + b"xyz", b'{"key":"' + DUMMY + b'"}'):
+            for enc in (base64.b64encode, base64.urlsafe_b64encode):
+                out = mask(b"Authorization: Basic " + enc(wrapped) + b"\n")
+                self.assertIn(b"[secret:K]", out, wrapped)
+                # what is left visible decodes to at most a few bytes of the value
+                visible = out.split(b"[secret:K]")
+                self.assertTrue(all(len(v.replace(b"Authorization: Basic ", b"").strip()) <= 12 for v in visible), out)
+
     def test_tiny_values_are_not_used_as_needles(self):
         self.assertEqual(kg.masker({"S": b"ab"})(b"about a cab"), b"about a cab")
 
